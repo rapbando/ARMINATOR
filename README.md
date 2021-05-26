@@ -4,6 +4,6 @@
 
 Work in progress.....
 
-I will upload all cad files once the project is polished. 
+I will upload all cad files and additive manufacturing know how once the project is polished. 
 
 Stay tuned!
