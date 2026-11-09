@@ -10,6 +10,9 @@
    - XBOX button returns all levers to neutral, then turns the motors off.
    - If the controller disconnects, all levers return to neutral, then the motors turn off.
    - Lever positions follow the controller inputs directly, so the step count can't drift.
+
+   Control is proportional: each lever is pushed in proportion to how far its stick or
+   trigger is moved, up to the maximum travel set below.
 */
 
 #include <XBOXUSB.h>
@@ -33,9 +36,16 @@
 #define Z_STP     4   // z axis stepper control
 #define A_STP     12  // a axis stepper control
 
-#define STICK_THRESHOLD 10000  // analog hat range is about -32768 to 32767
+// Proportional control: lever travel scales with how far a stick or trigger is pushed.
+// Analog hat range is about -32768 to 32767, triggers are 0 to 255.
+#define STICK_DEADZONE    8000   // stick values inside +/- this are neutral
+#define STICK_FULL        31000  // stick values beyond +/- this give full lever travel
+#define TRIGGER_DEADZONE  30     // trigger values below this are neutral
+#define TRIGGER_FULL      245    // trigger values above this give full lever travel
+#define TARGET_HYSTERESIS 8      // ignore target changes smaller than this (steps) to filter stick noise
+#define STATUS_PRINT_MS   200    // how often to print lever targets while they change
 
-// Lever travel in steps from neutral (200 steps are a shaft turn).
+// Maximum lever travel in steps from neutral (200 steps are a shaft turn).
 #define X_STEPS       850   // left stick X:  right = +, left = -
 #define A_STEPS       950   // L2 = +, R2 = -
 #define Y_STEPS       950   // right stick Y: down = +, up = -
@@ -175,13 +185,29 @@ StepperMotorHandler* yAxis;
 StepperMotorHandler* zAxis;
 StepperMotorHandler* aAxis;
 
-// Maps an analog hat value to a lever position: posSteps above the threshold,
-// negSteps below minus the threshold, neutral (0) in between.
+// Scales an input magnitude to 0..maxSteps: 0 up to the deadzone, maxSteps at or
+// beyond full, linear in between.
+int scaleToSteps(long magnitude, long deadzone, long full, int maxSteps)
+{
+  if (magnitude <= deadzone) return 0;
+  if (magnitude >= full) return maxSteps;
+  return (int)((magnitude - deadzone) * maxSteps / (full - deadzone));
+}
+
+// Maps an analog hat value to a lever position: proportional up to posSteps
+// when pushed positive, up to negSteps when pushed negative, 0 in the deadzone.
+// posSteps/negSteps carry the sign, so an axis can be inverted.
 int hatToSteps(int value, int posSteps, int negSteps)
 {
-  if (value > STICK_THRESHOLD) return posSteps;
-  if (value < -STICK_THRESHOLD) return negSteps;
+  long v = value;
+  if (v > 0) return (int)((long)scaleToSteps(v, STICK_DEADZONE, STICK_FULL, abs(posSteps)) * (posSteps < 0 ? -1 : 1));
+  if (v < 0) return (int)((long)scaleToSteps(-v, STICK_DEADZONE, STICK_FULL, abs(negSteps)) * (negSteps < 0 ? -1 : 1));
   return 0;
+}
+
+int triggerToSteps(uint8_t value, int maxSteps)
+{
+  return scaleToSteps(value, TRIGGER_DEADZONE, TRIGGER_FULL, maxSteps);
 }
 
 int xInput() { return hatToSteps(Xbox.getAnalogHat(LeftHatX), X_STEPS, -X_STEPS); }
@@ -189,36 +215,56 @@ int yInput() { return hatToSteps(Xbox.getAnalogHat(RightHatY), -Y_STEPS, Y_STEPS
 int zInput() { return hatToSteps(Xbox.getAnalogHat(LeftHatY), Z_STEPS_UP, -Z_STEPS_DOWN); }
 int aInput()
 {
-  // L2 and R2 together cancel out, as in the original sketch.
-  int steps = 0;
-  if (Xbox.getButtonPress(L2)) steps += A_STEPS;
-  if (Xbox.getButtonPress(R2)) steps -= A_STEPS;
-  return steps;
+  // L2 pushes A forward, R2 pushes it back; pressed together they cancel out.
+  return triggerToSteps(Xbox.getButtonPress(L2), A_STEPS) -
+         triggerToSteps(Xbox.getButtonPress(R2), A_STEPS);
 }
+
+bool targetsChanged = false;        // a lever target changed since the last status print
+unsigned long lastStatusPrint = 0;
 
 bool inputsNeutral()
 {
   return xInput() == 0 && yInput() == 0 && zInput() == 0 && aInput() == 0;
 }
 
-void moveAxis(StepperMotorHandler* axis, int target, const __FlashStringHelper* name)
+// Sets a lever's target. Small changes are ignored to filter stick noise, but
+// neutral (0) and full travel are always applied exactly.
+void moveAxis(StepperMotorHandler* axis, int target, int maxPos, int maxNeg)
 {
-  if (axis->getTarget() != target)
+  int current = axis->getTarget();
+  if (target == current) return;
+  if (target == 0 || target == maxPos || target == maxNeg ||
+      abs(target - current) >= TARGET_HYSTERESIS)
   {
     axis->setPosition(target);
-    Serial.print(F("\r\nAxis "));
-    Serial.print(name);
-    Serial.print(F(" -> "));
-    Serial.print(target);
+    targetsChanged = true;
   }
 }
 
 void moveAllAxes(int x, int y, int z, int a)
 {
-  moveAxis(xAxis, x, F("X"));
-  moveAxis(yAxis, y, F("Y"));
-  moveAxis(zAxis, z, F("Z"));
-  moveAxis(aAxis, a, F("A"));
+  moveAxis(xAxis, x, X_STEPS, -X_STEPS);
+  moveAxis(yAxis, y, Y_STEPS, -Y_STEPS);
+  moveAxis(zAxis, z, Z_STEPS_UP, -Z_STEPS_DOWN);
+  moveAxis(aAxis, a, A_STEPS, -A_STEPS);
+}
+
+// Prints all lever targets at most every STATUS_PRINT_MS, and only if one changed,
+// so proportional control doesn't flood the serial port.
+void printStatus()
+{
+  if (!targetsChanged || millis() - lastStatusPrint < STATUS_PRINT_MS) return;
+  lastStatusPrint = millis();
+  targetsChanged = false;
+  Serial.print(F("\r\nTargets X "));
+  Serial.print(xAxis->getTarget());
+  Serial.print(F(" Y "));
+  Serial.print(yAxis->getTarget());
+  Serial.print(F(" Z "));
+  Serial.print(zAxis->getTarget());
+  Serial.print(F(" A "));
+  Serial.print(aAxis->getTarget());
 }
 
 bool allAxesAtNeutral()
@@ -317,4 +363,6 @@ void loop() {
     }
     Serial.print(F("\r\nLevers at neutral - motors off"));
   }
+
+  printStatus();
 }
